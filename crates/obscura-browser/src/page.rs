@@ -3084,7 +3084,8 @@ impl Page {
             js.record_navigation_timing("domContentLoadedEventStart");
             let completed = js.execute_script(
                 "<dom-content-loaded>",
-                "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                "try { globalThis.__obscura_loadParserPreloads && globalThis.__obscura_loadParserPreloads(); } catch(e) {}\n\
+                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
             if completed.is_ok() {

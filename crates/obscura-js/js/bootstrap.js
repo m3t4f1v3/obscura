@@ -442,7 +442,7 @@ async function __runDynScriptTask(task) {
           const execute = () => {
             globalThis.__currentScriptNid = task.nid;
             try { (0, eval)(body); }
-            catch(e) { console.error('Dynamic script error (' + task.url + '):', e.message); }
+            catch(e) { _internalConsole.error('Dynamic script error (' + task.url + '):', e.message); }
             finally { globalThis.__currentScriptNid = task.prevNid || 0; }
             resolve();
           };
@@ -455,7 +455,7 @@ async function __runDynScriptTask(task) {
     // off the element. Calling onload separately would double-fire it.
     try { task.dispatchEvent(new Event('load')); } catch(e) {}
   } catch(e) {
-    console.error('Dynamic script fetch error:', e.message);
+    _internalConsole.error('Dynamic script fetch error:', e.message);
     try { task.dispatchEvent(new Event('error')); } catch(ex) {}
   } finally {
     if (task.delaysLoad) {
@@ -1003,6 +1003,11 @@ globalThis.console = {
   timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
+// Internal error reporting goes through the console captured here, not the
+// global binding: a page (or a sandboxed worker locking down its global) may
+// delete `console`, and a listener's exception must still be reported rather
+// than turn into a ReferenceError thrown out of dispatch.
+const _internalConsole = globalThis.console;
 
 let _tid = 0;
 const _intervals = new Set();
@@ -1146,7 +1151,7 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
       __obscuraPendingTimeoutDeadlines.delete(id);
       if (state.cancelled) return;
       _runTimerTask(taskNestingLevel, () => {
-        try { f(...args); } catch(e) { console.error("Timer error:", e); }
+        try { f(...args); } catch(e) { _internalConsole.error("Timer error:", e); }
       });
     },
   );
@@ -1181,7 +1186,7 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
   const tick = () => {
     if (!_intervals.has(id)) return;
     _runTimerTask(taskNestingLevel, () => {
-      try { f(...args); } catch(e) { console.error("Interval error:", e); }
+      try { f(...args); } catch(e) { _internalConsole.error("Interval error:", e); }
     });
     if (!_intervals.has(id)) return;
     const nextDelay = _timerDelayForNesting(normalizedDelay, taskNestingLevel);
@@ -1275,7 +1280,7 @@ function _runAnimationFrameBatch() {
       if (!batch.has(id)) continue;
       batch.delete(id);
       try { callback(timestamp); }
-      catch (e) { console.error("Animation frame error:", e); }
+      catch (e) { _internalConsole.error("Animation frame error:", e); }
     }
   } finally {
     _rafRunningFrame = false;
@@ -1372,7 +1377,7 @@ function _browserPostedTaskRunOne(currentGeneration = _invalidPostedTaskGenerati
 
   __obscuraCore.ops.op_begin_render_task?.();
   try { callback(); }
-  catch (error) { console.error("Posted task error:", error); }
+  catch (error) { _internalConsole.error("Posted task error:", error); }
   finally {
     if (_browserPostedTaskQueues.some(queue => queue.length)) {
       _browserPostedTaskScheduleWake();
@@ -2088,7 +2093,7 @@ function _eventTargetDispatch(target, event) {
           }
         } else if (result === false) event.preventDefault();
       } catch (error) {
-        console.error(error);
+        _internalConsole.error(error);
       }
     }
     const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
@@ -2101,7 +2106,7 @@ function _eventTargetDispatch(target, event) {
         if (typeof callback === "function") callback.call(target, event);
         else callback.handleEvent.call(callback, event);
       } catch (error) {
-        console.error(error);
+        _internalConsole.error(error);
       }
       if (event._immediatePropagationStopped) break;
     }
@@ -2156,7 +2161,7 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
       try {
         if (inlineFn.call(target, event) === false) event.preventDefault();
       } catch (error) {
-        console.error(error);
+        _internalConsole.error(error);
       }
     }
   }
@@ -2171,7 +2176,7 @@ function _domEventInvokeHandlers(target, event, capture, phase) {
       if (typeof entry.callback === "function") entry.callback.call(target, event);
       else entry.callback.handleEvent.call(entry.callback, event);
     } catch (error) {
-      console.error(error);
+      _internalConsole.error(error);
     }
     if (event._immediatePropagationStopped) break;
   }
@@ -2272,7 +2277,7 @@ function __prepareInsertedScript(script) {
       }
     }
     if (error) {
-      console.error('Import map error:', error);
+      _internalConsole.error('Import map error:', error);
       queueMicrotask(() => {
         try { script.dispatchEvent(new Event('error')); } catch (_) {}
       });
@@ -2306,7 +2311,7 @@ function __prepareInsertedScript(script) {
         ? src
         : new URL(src, baseUrl).href;
     } catch(e) {
-      console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
+      _internalConsole.error('Dynamic script URL resolve failed (' + src + '):', e.message);
       fullUrl = src;
     }
     const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
@@ -2384,7 +2389,7 @@ function __prepareInsertedScript(script) {
   } else {
     globalThis.__currentScriptNid = script._nid;
     try { (0, eval)(code); }
-    catch(e) { console.error('Dynamic inline script error:', e.message); }
+    catch(e) { _internalConsole.error('Dynamic inline script error:', e.message); }
     finally { globalThis.__currentScriptNid = prevNid || 0; }
   }
 }
@@ -4141,7 +4146,7 @@ class Animation {
     this._resolveFinished(this);
     const event = new Event('finish');
     this.dispatchEvent(event);
-    if (typeof this.onfinish === 'function') { try { this.onfinish.call(this, event); } catch (e) { console.error(e); } }
+    if (typeof this.onfinish === 'function') { try { this.onfinish.call(this, event); } catch (e) { _internalConsole.error(e); } }
   }
   cancel() {
     if (this._finishTimer != null) clearTimeout(this._finishTimer);
@@ -4154,7 +4159,7 @@ class Animation {
     this._rejectFinished(new DOMException('The animation was canceled', 'AbortError'));
     const event = new Event('cancel');
     this.dispatchEvent(event);
-    if (typeof this.oncancel === 'function') { try { this.oncancel.call(this, event); } catch (e) { console.error(e); } }
+    if (typeof this.oncancel === 'function') { try { this.oncancel.call(this, event); } catch (e) { _internalConsole.error(e); } }
     this._resetFinishedPromise();
   }
   reverse() { throw new DOMException('reverse() is not implemented for this animation', 'NotSupportedError'); }
@@ -8383,11 +8388,11 @@ class NetworkInformation {
   dispatchEvent(event) {
     if (!event || !event.type) return true;
     for (const listener of this._listeners[event.type] || []) {
-      try { listener.call(this, event); } catch (error) { console.error(error); }
+      try { listener.call(this, event); } catch (error) { _internalConsole.error(error); }
     }
     const handler = this["on" + event.type];
     if (typeof handler === "function") {
-      try { handler.call(this, event); } catch (error) { console.error(error); }
+      try { handler.call(this, event); } catch (error) { _internalConsole.error(error); }
     }
     return !event.defaultPrevented;
   }
@@ -11168,7 +11173,7 @@ function _notifyMutationObservers() {
 function _reportMutationObserverError(error) {
   try {
     if (typeof globalThis.reportError === "function") globalThis.reportError(error);
-    else console.error(error);
+    else _internalConsole.error(error);
   } catch (e) { /* reporting must not stop delivery */ }
 }
 // Every observing MutationObserver in creation order, which is delivery order.
@@ -13611,7 +13616,7 @@ function _structuredClone(value, seen) {
   return out;
 }
 globalThis.structuredClone = globalThis.structuredClone || ((v) => _structuredClone(v, new Map()));
-globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
+globalThis.reportError = globalThis.reportError || ((e) => _internalConsole.error(e));
 
 // WHATWG Storage as a legacy platform object: a Proxy routes property access
 // (localStorage.foo, localStorage["foo"], delete, `in`, Object.keys) through
@@ -13932,7 +13937,7 @@ globalThis.atob = globalThis.atob || ((s) => {
       if (!event || !event.type) return true;
       const list = (listeners[String(event.type)] || []).slice();
       for (const callback of list) {
-        try { callback.call(nav, event); } catch (error) { console.error(error); }
+        try { callback.call(nav, event); } catch (error) { _internalConsole.error(error); }
       }
       return !event.defaultPrevented;
     },
@@ -15972,12 +15977,12 @@ class _IframeDocument {
     const list = this._listeners && this._listeners[type];
     if (list) {
       for (const listener of list.slice()) {
-        try { listener.call(this, event); } catch (error) { console.error(error); }
+        try { listener.call(this, event); } catch (error) { _internalConsole.error(error); }
       }
     }
     const handler = this['on' + type];
     if (typeof handler === 'function') {
-      try { handler.call(this, event); } catch (error) { console.error(error); }
+      try { handler.call(this, event); } catch (error) { _internalConsole.error(error); }
     }
     return !event.defaultPrevented;
   }
@@ -16182,7 +16187,7 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
       globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
         new MessageEvent('message', { data: clone, origin, source: globalThis })));
     } catch (error) {
-      console.error('message listener failed:', error && error.message || error);
+      _internalConsole.error('message listener failed:', error && error.message || error);
     }
   }, 0);
 }
@@ -16256,7 +16261,7 @@ function _ensureInitialFrameRealm(element, srcdoc) {
       const sources = JSON.parse(__obscuraCore.ops.op_frame_preload_scripts());
       for (const source of sources) {
         try { evaluate(source); }
-        catch (error) { console.error('Frame preload failed:', error && error.message || error); }
+        catch (error) { _internalConsole.error('Frame preload failed:', error && error.message || error); }
       }
       if (sources.length) initializeFrames();
     }
@@ -16337,7 +16342,7 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
     globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
       new MessageEvent('message', { data, origin, source })));
   } catch (error) {
-    console.error('message listener failed:', error && error.message || error);
+    _internalConsole.error('message listener failed:', error && error.message || error);
   }
 };
 
@@ -17353,7 +17358,7 @@ globalThis.Worker = class Worker {
       const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
       fn.call(scope, scope, this._code);
     } catch(e) {
-      console.error('Worker error:', e.message);
+      _internalConsole.error('Worker error:', e.message);
       if (this.onerror) this.onerror(e);
     } finally {
       if (!this._terminated) {
@@ -17378,7 +17383,7 @@ globalThis.Worker = class Worker {
         const evs = (scope._ev && scope._ev['message']) || [];
         for (const handler of evs.slice()) handler.call(scope, event);
       } catch(e) {
-        console.error('Worker error:', e.message);
+        _internalConsole.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
       }
     }, 0);
@@ -19289,7 +19294,7 @@ if (typeof FontFace === 'undefined') {
       this.dispatchEvent(event);
       const handler = this['on' + type];
       if (typeof handler === 'function') {
-        try { handler.call(this, event); } catch (error) { console.error(error); }
+        try { handler.call(this, event); } catch (error) { _internalConsole.error(error); }
       }
     }
     _syncNative() {

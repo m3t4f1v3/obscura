@@ -8894,13 +8894,45 @@ const _fetch = (async function _fetch(input, init = {}, resourceType = "Fetch") 
   });
   _attachResponseAbort(response, signal);
   if (typeof parsed.bodyRid === 'number') {
-    // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
-    // stream backpressure rather than eagerly queuing every network chunk.
-    const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid)
-      .catch(error => { throw signalState && signalState.aborted ? signalState.reason : error; })
-      .finally(cleanup);
+    const rid = parsed.bodyRid;
+    let promise;
+    let stream = null;
+    if (parsed.bodyStreamable) {
+      // The body is pulled chunk by chunk as it arrives, so `response.body`
+      // readers see a server-sent stream progressively (chat replies, live
+      // logs) instead of only once the server closes it. The chunks are also
+      // kept for text()/json(). Pulling starts now, as the one-shot read did,
+      // so an unread body still completes and settles the network.
+      stream = { chunks: [], done: false, error: null, waiters: [] };
+      const wake = () => { for (const waiter of stream.waiters.splice(0)) waiter(); };
+      promise = (async () => {
+        try {
+          for (;;) {
+            const chunk = await __obscuraCore.ops.op_fetch_body_chunk(rid);
+            if (!chunk.length) break;
+            stream.chunks.push(chunk);
+            wake();
+          }
+        } catch (error) {
+          stream.error = signalState && signalState.aborted ? signalState.reason : error;
+          wake();
+          throw stream.error;
+        }
+        stream.done = true;
+        wake();
+        const total = stream.chunks.reduce((size, chunk) => size + chunk.length, 0);
+        const bytes = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of stream.chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+        return bytes;
+      })().finally(cleanup);
+    } else {
+      promise = __obscuraCore.ops.op_fetch_body(rid)
+        .catch(error => { throw signalState && signalState.aborted ? signalState.reason : error; })
+        .finally(cleanup);
+    }
     promise.catch(() => {}); // An unread/cancelled body must not report an unhandled rejection.
-    response._fetchBody = { promise, resource: { rid: parsed.bodyRid, consumers: 1 } };
+    response._fetchBody = { promise, resource: { rid, consumers: 1 }, stream };
   } else cleanup();
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
@@ -9401,7 +9433,36 @@ if (typeof Response === 'undefined') {
       if (this._bodyNull) return null;
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
       if (!this._bodyStream) {
-        this._bodyStream = new ReadableStream({
+        const streamed = this._fetchBody && this._fetchBody.stream;
+        let nextChunk = 0;
+        this._bodyStream = new ReadableStream(streamed ? {
+          start: (controller) => {
+            if (this._bodyAborted) controller.error(this._bodyAbortReason);
+          },
+          // Each network chunk as it arrives (see _fetch).
+          pull: (controller) => new Promise(resolve => {
+            const step = () => {
+              if (nextChunk < streamed.chunks.length) {
+                controller.enqueue(streamed.chunks[nextChunk++].slice());
+              } else if (streamed.error) {
+                controller.error(streamed.error);
+              } else if (streamed.done) {
+                controller.close();
+              } else {
+                streamed.waiters.push(step);
+                return;
+              }
+              resolve();
+            };
+            step();
+          }),
+          cancel: () => {
+            this._bodyUsed = true;
+            if (this._fetchBody && --this._fetchBody.resource.consumers === 0) {
+              __obscuraCore.ops.op_try_close(this._fetchBody.resource.rid);
+            }
+          },
+        } : {
           start: (controller) => {
             if (this._bodyAborted) { controller.error(this._bodyAbortReason); return; }
             const deliver = (bytes) => {

@@ -64,6 +64,7 @@ integration_tests!(
     runtime_primitives,
     scroll_event_on_assignment,
     structured_clone_crypto_parity,
+    textarea_default_value_and_style_iteration,
     textarea_enter_selection,
     treewalker_document_order,
     window_conformance_parity,

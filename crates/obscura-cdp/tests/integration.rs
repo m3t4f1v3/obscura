@@ -56,6 +56,7 @@ integration_tests!(
     nodefilter_constants,
     page_close_destroys_target,
     page_frame_contract,
+    percentage_height_through_stretch_and_contents,
     runtime_by_value_undefined,
     runtime_console_events,
     runtime_get_properties_objectid_escaping,

@@ -797,6 +797,11 @@ const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _formIndeterminate = globalThis._formIndeterminate;
+// A textarea's default value is its child text content, which is also what
+// the renderer paints, so the value setter mirrors the live value into it.
+// The text content from before the first value write is kept here so
+// `defaultValue` still reports the parsed default once the value is dirty.
+const _textareaDefaults = new WeakMap();
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 const _formStateLoaded = new Set();
 function _loadFormState(nid) {
@@ -1878,6 +1883,9 @@ class CSSStyleDeclaration {
   }
   get length() { this._pull(); return Object.keys(this._props).length; }
   item(i) { this._pull(); return Object.keys(this._props)[i] || ""; }
+  // Interfaces with an indexed getter and a length are iterable, so
+  // `[...el.style]` lists the declared property names.
+  *[Symbol.iterator]() { for (let i = 0; i < this.length; i++) yield this.item(i); }
 }
 
 const _styleProxyHandler = {
@@ -5062,6 +5070,10 @@ class Element extends Node {
           : _domParse('get_attribute', this._nid, 'value')) ?? '';
       }
       changed = previous !== value;
+    }
+    if (tag === 'textarea' && !_textareaDefaults.has(this)) {
+      // The DOM's own text, not the textContent getter a page may override.
+      _textareaDefaults.set(this, _domParse('text_content', this._nid) ?? '');
     }
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
@@ -14445,6 +14457,8 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
         } else {
           f.value = f.getAttribute('value') || '';
         }
+      } else if (f.localName === 'textarea') {
+        f.value = f.defaultValue;
       } else if ('value' in f) {
         f.value = '';
       }
@@ -14469,7 +14483,22 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
     return Number.isFinite(v) && v > 0 ? v : 20;
   }
   set cols(v) { this.setAttribute('cols', String(v)); }
+  get defaultValue() {
+    return _textareaDefaults.has(this)
+      ? _textareaDefaults.get(this)
+      : (_domParse('text_content', this._nid) ?? '');
+  }
+  set defaultValue(v) {
+    const value = String(v);
+    // Once the value is dirty the children carry the live value; keep the
+    // new default aside so the painted value does not change.
+    if (_textareaDefaults.has(this)) _textareaDefaults.set(this, value);
+    else this.textContent = value;
+  }
 };
+// Framework value trackers read own prototype descriptors, not inherited ones.
+Object.defineProperty(HTMLTextAreaElement.prototype, 'value',
+  Object.getOwnPropertyDescriptor(Element.prototype, 'value'));
 globalThis.HTMLLabelElement = Element;
 for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
   Object.defineProperty(proto, 'readOnly', { enumerable: true });

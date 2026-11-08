@@ -688,7 +688,10 @@ async function _loadLinkedStylesheet(c) {
   }
   const href = c.getAttribute('href');
   if (!href) return;
-  if (!c.getAttribute('rel') && c.rel) c.setAttribute('rel', String(c.rel));
+  if (!c.getAttribute('rel') && c.rel) {
+    _linkRelSyncing.add(c);
+    try { c.setAttribute('rel', String(c.rel)); } finally { _linkRelSyncing.delete(c); }
+  }
   if (Object.prototype.hasOwnProperty.call(c, 'media')) {
     if (c.media) c.setAttribute('media', String(c.media));
     else c.removeAttribute('media');
@@ -730,6 +733,7 @@ const _preloadDestinations = {
 async function _loadPreloadLink(c, modulePreload) {
   const href = c.getAttribute('href');
   if (!href) return;
+  _preloadStarted.add(c);
   const as = (c.getAttribute('as') || c.as || '').toString().toLowerCase();
   const destination = modulePreload ? "Script" : _preloadDestinations[as];
   if (!destination) return;
@@ -751,6 +755,36 @@ async function _loadPreloadLink(c, modulePreload) {
   } catch(e) {}
   try { c.dispatchEvent(new Event(loaded ? 'load' : 'error', { bubbles: true })); } catch(e) {}
 }
+
+// Links whose rel attribute _loadLinkedStylesheet is writing back itself.
+const _linkRelSyncing = new WeakSet();
+// Preload links already fetched (on insertion or a rel change).
+const _preloadStarted = new WeakSet();
+
+// Changing a connected link's rel, href or as fetches what it now names, as
+// Chrome does. The common case is a parser-inserted
+// <link rel="preload" as="style"> whose load handler switches it to
+// rel="stylesheet"; pages wait for that sheet's load event before showing
+// content that depends on it.
+function _linkAttributeChanged(link, name, oldValue, value) {
+  if (oldValue === value || _linkRelSyncing.has(link) || !link.isConnected) return;
+  if (name !== 'rel' && name !== 'href' && name !== 'as') return;
+  _loadLinkedStylesheet(link);
+}
+
+// Parser-inserted preload links are not fetched by the host, so nothing
+// fired their load or error. Called once the parser's own scripts have run,
+// so listeners those scripts attached see the events.
+globalThis.__obscura_loadParserPreloads = function() {
+  let links;
+  try { links = document.querySelectorAll('link[rel~="preload"], link[rel~="modulepreload"]'); }
+  catch(e) { return; }
+  for (const link of links) {
+    const rels = (link.getAttribute('rel') || '').toLowerCase().split(/\s+/);
+    if (rels.includes('stylesheet') || _preloadStarted.has(link)) continue;
+    _loadPreloadLink(link, rels.includes('modulepreload'));
+  }
+};
 
 function _fpRand(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
@@ -4487,8 +4521,12 @@ class Element extends Node {
       : null;
     const observedOldValue = _attributeOldValuesWanted() ? this.getAttribute(n) : null;
     const customOldValue = _customElementObserves(this, n) ? this.getAttribute(n) : undefined;
+    const linkOldValue = this.localName === 'link' && (n === 'rel' || n === 'href' || n === 'as')
+      ? this.getAttribute(n)
+      : undefined;
     const value = String(v);
     _dom("set_attribute", this._nid, n + "\0" + value);
+    if (linkOldValue !== undefined) _linkAttributeChanged(this, n, linkOldValue, value);
     if (detailsWasOpen !== null) _queueDetailsToggle(this, detailsWasOpen);
     if (n === "src" && this.localName === "iframe" && !this.hasAttribute('srcdoc')) {
       if (value && value !== "about:blank") this._loadIframeSrc(value);
@@ -5282,10 +5320,11 @@ class Element extends Node {
   set placeholder(v) { this.setAttribute("placeholder", v); }
   get accept() { return this.getAttribute("accept") || ""; }
   set accept(v) { this.setAttribute("accept", v); }
-  // For <a>/<area>, href returns the resolved absolute URL (the spec behavior,
-  // and what scrapers want). It uses op_url_resolve, which returns just the
-  // resolved string, rather than the full-component op the decomposition
-  // members use. Other elements reflect the raw attribute.
+  // For <a>/<area>/<link>, href returns the resolved absolute URL (the spec
+  // behavior: all three reflect it as a URL, and pages match links by
+  // comparing link.href with new URL(...).href). It uses op_url_resolve, which
+  // returns just the resolved string, rather than the full-component op the
+  // decomposition members use. Other elements reflect the raw attribute.
   get href() {
     const ln = this.localName;
     // SVG href-bearing elements reflect href as an SVGAnimatedString (with the
@@ -5298,7 +5337,7 @@ class Element extends Node {
       if (!this._svgHref) this._svgHref = new SVGAnimatedString(this, "href", "xlink:href");
       return this._svgHref;
     }
-    if (ln === 'a' || ln === 'area') {
+    if (ln === 'a' || ln === 'area' || ln === 'link') {
       const raw = this.getAttribute('href');
       if (raw === null) return '';
       // Legacy-charset document: href must reflect the encoding-override query.

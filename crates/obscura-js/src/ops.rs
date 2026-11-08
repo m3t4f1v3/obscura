@@ -7250,6 +7250,34 @@ fn op_initial_frame(
     })).unwrap_or(0)
 }
 
+/// A fresh realm for a dedicated worker, returning its global object.
+///
+/// Workers ran inside their creator's realm, so a worker that locks down its
+/// global (deleting capabilities and freezing every reachable intrinsic, as
+/// sandboxed widget runtimes do) froze its creator's intrinsics too. This
+/// realm has its own intrinsics and web APIs. It takes the creator's security
+/// token so the creator can set it up and the two can share objects such as
+/// transferred MessagePorts. It has no document and is not a frame.
+#[op2]
+fn op_create_worker_realm<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>) -> v8::Local<'s, v8::Value> {
+    let undefined = v8::undefined(scope).into();
+    let creator = scope.get_entered_or_microtask_context();
+    let main_context = scope.get_current_context();
+    let Some(context) = v8::Context::from_snapshot(scope, 1, Default::default())
+        .or_else(|| v8::Context::from_snapshot(scope, 0, Default::default()))
+    else { return undefined };
+    // Same borrowed deno_core slots as frame realms; never owned here.
+    unsafe {
+        for index in [deno_core::CONTEXT_STATE_SLOT_INDEX, deno_core::MODULE_MAP_SLOT_INDEX] {
+            let pointer = main_context.get_aligned_pointer_from_embedder_data(index);
+            context.set_aligned_pointer_in_embedder_data(index, pointer);
+        }
+    }
+    context.clear_all_slots();
+    context.set_security_token(creator.get_security_token(scope));
+    context.global(scope).into()
+}
+
 /// Whether async host work can be scheduled without aborting the isolate.
 ///
 /// Some low-level embedders intentionally execute a synchronous expression
@@ -7288,8 +7316,16 @@ fn op_posted_task(
             }
             PostedTaskOwnerStatus::Generation(generation) => generation as f64,
         };
-        v8::tc_scope!(let scope, scope);
+        // Run the task in its own realm. Ops identify the calling realm by the
+        // entered context (see realm_state), and the spawner enters the page's:
+        // a frame's MessagePort handler posting to its parent was taken for a
+        // page self-post and dispatched on the frame's own window.
         let callback = v8::Local::new(scope, callback);
+        let context = callback
+            .get_creation_context(scope)
+            .unwrap_or_else(|| scope.get_current_context());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(let scope, scope);
         let receiver = v8::undefined(scope).into();
         let current_generation = v8::Number::new(scope, current_generation);
         if callback
@@ -8648,6 +8684,7 @@ pub fn build_extension() -> Extension {
         op_document_realm_member(),
         op_register_document_realm(),
         op_post_frame_message(),
+        op_create_worker_realm(),
         op_sleep(),
         op_async_runtime_available(),
         op_posted_task(),

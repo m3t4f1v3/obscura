@@ -1026,6 +1026,7 @@ const _scheduleAfter = (delay, fn) => {
       }
       if (state.cancelled) return;
       __obscuraCore.ops.op_begin_render_task?.();
+      _recoverInterruptedRendering();
       fn();
     });
     return frameTimerId;
@@ -1040,6 +1041,7 @@ const _scheduleAfter = (delay, fn) => {
     // time lazily on that task's first style/layout read so a callback that
     // waited in the host queue samples its actual delivery instant.
     __obscuraCore.ops.op_begin_render_task?.();
+    _recoverInterruptedRendering();
     return fn();
   }, d, undefined, false, true, false);
 };
@@ -1189,7 +1191,26 @@ function _scheduleRenderingOpportunity() {
   if (_renderOpportunityScheduled || _renderOpportunityRunning
       || !_renderOpportunityHasWork()) return;
   _renderOpportunityScheduled = true;
-  _scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity);
+  // Without an async runtime (a synchronous host call) nothing is queued.
+  // Leaving the flag set then stopped every later frame: rAF, and with it
+  // Playwright's actionability checks, never ran again on the page.
+  if (_scheduleAfter(_RAF_FRAME_DELAY_MS, _runRenderingOpportunity) === undefined) {
+    _renderOpportunityScheduled = false;
+  }
+}
+
+// A watchdog that terminates a long script unwinds past `finally`, so a
+// rendering opportunity (or animation frame batch) cut off that way left its
+// running flag set and no frame ever ran again on the page. A timer task
+// starts with none of them on the stack: clear what such a run left behind.
+function _recoverInterruptedRendering() {
+  if (!_renderOpportunityRunning && !_rafRunningFrame) return;
+  _renderOpportunityRunning = false;
+  _rafRunningFrame = false;
+  _rafCurrentBatch = null;
+  _renderOpportunityScheduled = false;
+  if (_rafPending.size) _rafFrameScheduled = true;
+  _scheduleRenderingOpportunity();
 }
 
 function _runRenderingOpportunity() {

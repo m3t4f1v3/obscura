@@ -26,6 +26,10 @@ fn insert_text_js(text: &str, ime_commit: bool) -> String {
     format!(
         "(function() {{\
             var t = document.activeElement;\
+            if (t && t.localName !== 'input' && t.localName !== 'textarea' && t.isContentEditable) {{\
+                document.execCommand('insertText', false, {text});\
+                return;\
+            }}\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
             if (globalThis.__obscura_isDisabled(t)) return;\
             if (!{ime_commit} && t.hasAttribute('readonly')) return;\
@@ -220,7 +224,7 @@ pub async fn handle(
                             var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,composed:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                             if (!evt.defaultPrevented) {{\
-                                var focusTarget = globalThis.__obscura_interactiveHost(target) || (target.closest && target.closest('[tabindex]'));\
+                                var focusTarget = globalThis.__obscura_interactiveHost(target) || (target.closest && target.closest('[tabindex], [contenteditable=\"\"], [contenteditable=\"true\" i], [contenteditable=\"plaintext-only\" i]'));\
                                 if (focusTarget && !globalThis.__obscura_isDisabled(focusTarget)) focusTarget.focus();\
                                 else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();\
                             }}\

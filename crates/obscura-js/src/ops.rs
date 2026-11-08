@@ -996,8 +996,18 @@ fn fetch_max_body_bytes() -> usize {
 /// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
 /// a multi-GB response from ever being fully allocated.
 async fn read_body_capped(
+    response: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    read_body_capped_into(response, max, None).await
+}
+
+/// Like `read_body_capped`, also handing each chunk to `sink` as it arrives
+/// so script can read the body incrementally (see `op_fetch_body_chunk`).
+async fn read_body_capped_into(
     mut response: reqwest::Response,
     max: usize,
+    sink: Option<&FetchChunkSink>,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
     if let Some(len) = response.content_length() {
         if len > max as u64 {
@@ -1017,9 +1027,20 @@ async fn read_body_capped(
                 "response body exceeds the maximum of {max} bytes"
             )));
         }
+        if let Some(sink) = sink {
+            if !chunk.is_empty() {
+                sink.chunks.borrow_mut().push_back(chunk.to_vec());
+            }
+        }
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// Chunks of a response body not yet read by script, in arrival order.
+#[derive(Default)]
+pub(crate) struct FetchChunkSink {
+    chunks: RefCell<VecDeque<Vec<u8>>>,
 }
 
 struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
@@ -1090,6 +1111,10 @@ struct FetchBodyResource {
     body: RefCell<Option<AsyncResult<Vec<u8>>>>,
     cancel: Rc<CancelHandle>,
     opaque: bool,
+    /// Set when the transport hands chunks over as they arrive; the body is
+    /// then read with op_fetch_body_chunk instead of op_fetch_body.
+    sink: Option<Rc<FetchChunkSink>>,
+    finished: Cell<bool>,
 }
 
 impl Resource for FetchBodyResource {
@@ -1118,23 +1143,89 @@ async fn op_fetch_body(
     result?.map(|bytes| if resource.opaque { Vec::new() } else { bytes })
 }
 
+/// The next chunk of a streamed response body, as it arrives from the network;
+/// an empty buffer once the body is complete. Reading drives the transport,
+/// so an unread body is not pulled further than the chunk already buffered.
+#[op2]
+#[buffer]
+async fn op_fetch_body_chunk(
+    state: Rc<RefCell<OpState>>,
+    rid: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let resource = state.borrow().resource_table.get::<FetchBodyResource>(rid)
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
+    let Some(sink) = resource.sink.clone() else {
+        return Err(deno_error::JsErrorBox::type_error("Response body is not streamable"));
+    };
+    let next = std::future::poll_fn(|cx| {
+        loop {
+            if resource.cancel.is_canceled() {
+                return std::task::Poll::Ready(Err(deno_error::JsErrorBox::generic(
+                    "Response body was cancelled")));
+            }
+            if let Some(chunk) = sink.chunks.borrow_mut().pop_front() {
+                return std::task::Poll::Ready(Ok(chunk));
+            }
+            if resource.finished.get() {
+                return std::task::Poll::Ready(Ok(Vec::new()));
+            }
+            let mut slot = resource.body.borrow_mut();
+            let Some(body) = slot.as_mut() else {
+                return std::task::Poll::Ready(Err(deno_error::JsErrorBox::type_error(
+                    "Body is already consumed")));
+            };
+            match body.as_mut().poll(cx) {
+                std::task::Poll::Ready(result) => {
+                    *slot = None;
+                    resource.finished.set(true);
+                    if let Err(error) = result {
+                        sink.chunks.borrow_mut().clear();
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                }
+                std::task::Poll::Pending => {
+                    if let Some(chunk) = sink.chunks.borrow_mut().pop_front() {
+                        return std::task::Poll::Ready(Ok(chunk));
+                    }
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+    })
+    // Aborting the fetch cancels the handle, which must end a pending read.
+    .or_cancel(resource.cancel.clone())
+    .await
+    .unwrap_or_else(|_| Err(deno_error::JsErrorBox::generic("Response body was cancelled")));
+    let done = matches!(&next, Ok(chunk) if chunk.is_empty()) || next.is_err();
+    if done {
+        if let Ok(resource) = state.borrow_mut().resource_table.take_any(rid) {
+            resource.close();
+        }
+    }
+    next.map(|chunk| if resource.opaque { Vec::new() } else { chunk })
+}
+
 async fn fetch_body_result(
     state: &RefCell<OpState>,
     mut metadata: serde_json::Value,
     body: AsyncResult<Vec<u8>>,
     internal_load: bool,
     cancel: Option<Rc<CancelHandle>>,
+    sink: Option<Rc<FetchChunkSink>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     if internal_load {
         let bytes = body.await?;
         metadata["body"] = serde_json::json!(String::from_utf8_lossy(&bytes));
         metadata["bodyBase64"] = serde_json::json!(BASE64.encode(&bytes));
     } else {
+        let streamable = sink.is_some();
         let rid = state.borrow_mut().resource_table.add(FetchBodyResource {
             body: RefCell::new(Some(body)), cancel: cancel.unwrap_or_else(CancelHandle::new_rc),
             opaque: metadata["opaque"].as_bool().unwrap_or(false),
+            sink, finished: Cell::new(false),
         });
         metadata["bodyRid"] = serde_json::json!(rid);
+        metadata["bodyStreamable"] = serde_json::json!(streamable);
     }
     Ok(metadata.to_string())
 }
@@ -4657,10 +4748,12 @@ async fn fetch_url_inner(
     });
     // A resource must not form an ownership cycle with its OpState table.
     let body_state = Rc::downgrade(&state);
+    let sink = Rc::new(FetchChunkSink::default());
+    let body_sink = sink.clone();
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
-        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let resp_bytes = read_body_capped_into(response, fetch_max_body_bytes(), Some(&body_sink)).await?;
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(
@@ -4689,7 +4782,7 @@ async fn fetch_url_inner(
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
         Ok(resp_bytes)
     });
-    fetch_body_result(&state, metadata, body, internal_load, cancel).await
+    fetch_body_result(&state, metadata, body, internal_load, cancel, Some(sink)).await
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -4941,7 +5034,7 @@ async fn stealth_fetch_all(
         } else { network_guard.event = None; }
         Ok(resp_bytes)
     });
-    fetch_body_result(&state, metadata, body, internal_load, cancel).await
+    fetch_body_result(&state, metadata, body, internal_load, cancel, None).await
 }
 
 pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
@@ -8539,6 +8632,7 @@ pub fn build_extension() -> Extension {
         op_fetch_cancel_handle(),
         op_abort_signal_state(),
         op_fetch_body(),
+        op_fetch_body_chunk(),
         op_get_cookies(),
         op_set_cookie(),
         op_storage_access(),

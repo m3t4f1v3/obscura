@@ -1723,8 +1723,13 @@ mod tests {
         let queued = parent.take_pending_frame_messages();
         assert_eq!(queued.len(), 64, "the queue was not capped");
         // The messages kept are the earliest, which is the half of a handshake
-        // that matters.
-        assert_eq!(queued[0].data_json, r#"{"v":0}"#);
+        // that matters: the first one delivered to the page is 0.
+        let json = serde_json::to_string(&queued[0].data_json).unwrap();
+        parent.execute_script("<test>", &format!(
+            "globalThis.__got = []; addEventListener('message', e => __got.push(e.data)); \
+             __obscura_deliverMessage({json}, 'https://child.example', 1, '*');"
+        )).unwrap();
+        assert_eq!(parent.evaluate("globalThis.__got").unwrap(), serde_json::json!([0]));
         std::env::remove_var("OBSCURA_FRAME_MESSAGE_QUEUE_ENTRIES");
     }
 

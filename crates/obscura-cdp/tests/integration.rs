@@ -44,6 +44,7 @@ integration_tests!(
     file_navigation_gate,
     file_upload_integrity,
     form_submit_method_bypasses_listener,
+    frame_workers_and_transferred_ports,
     iframe_event_dispatch,
     input_activation_author_accessors,
     input_key_event_escaping,

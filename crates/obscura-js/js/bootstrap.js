@@ -1260,7 +1260,26 @@ globalThis.cancelAnimationFrame = (id) => {
   _rafPending.delete(id);
   if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
 };
-globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
+// deno_core runs V8 with --enable-queue-microtask, whose native global
+// survives a `delete`: removing the property exposes another copy, and V8
+// installs it again in every context created from the snapshot. In a browser
+// queueMicrotask is one ordinary configurable property, and sandboxed runtimes
+// (chatgpt.com's widget worker among them) delete it and verify it is gone, so
+// each context keeps the same function as a single plain property.
+// Runs per context: from __obscura_init and in worker realm setup.
+function _normalizeQueueMicrotask(global = globalThis) {
+  const queueMicrotaskFn = global.queueMicrotask || ((fn) => Promise.resolve().then(fn));
+  // deno_core's wrapper finds the native underneath on its first call, by
+  // removing itself for a moment. Let it do that before the native goes.
+  try { queueMicrotaskFn(() => {}); } catch (_) {}
+  for (let i = 0; i < 4 && Object.getOwnPropertyDescriptor(global, 'queueMicrotask'); i++) {
+    delete global.queueMicrotask;
+  }
+  Object.defineProperty(global, 'queueMicrotask', {
+    value: queueMicrotaskFn, writable: true, enumerable: true, configurable: true,
+  });
+}
+_normalizeQueueMicrotask();
 
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
 // timer wheel imposes roughly a one-millisecond floor even for delay zero,
@@ -1574,13 +1593,13 @@ function _messagePortScheduleDelivery(port) {
     if (!current) return;
     current.messageDeliveryPending = false;
     if (current.closed || !current.messageQueueEnabled || !current.messageQueue.length) return;
-    const data = current.messageQueue.shift().data;
+    const entry = current.messageQueue.shift();
     const event = new MessageEvent("message", {
-      data,
+      data: entry.data,
       origin: "",
       lastEventId: "",
       source: null,
-      ports: [],
+      ports: entry.ports || [],
     });
     _eventTargetDispatch(port, event);
     _messagePortScheduleDelivery(port);
@@ -1598,6 +1617,9 @@ class MessagePort {
     if (key !== _messagePortConstructionKey) throw new TypeError("Illegal constructor");
     _messagePortState.set(this, {
       entangled: null,
+      // A peer in another realm: { frameId, portId }. Messages to it go
+      // through the host like window messages (see _sendRealmMessage).
+      remote: null,
       messageQueue: [],
       messageQueueEnabled: false,
       messageDeliveryPending: false,
@@ -1609,21 +1631,32 @@ class MessagePort {
     });
   }
   postMessage(message, options) {
+    // Transferred ports travel beside the message and arrive in event.ports;
+    // structured clone does not move them here.
+    const ports = _transferList(options).filter(item => item instanceof MessagePort);
     // Structured serialization happens before inspecting the entanglement.
     // This preserves the browser-observable DataCloneError on closed ports and
     // prevents mutations after postMessage from changing the delivered value.
     let cloned;
     try {
-      cloned = globalThis.structuredClone(message, options);
+      cloned = globalThis.structuredClone(message, ports.length ? undefined : options);
     } catch (error) {
       throw error;
     }
     const state = _messagePortStateFor(this);
+    if (ports.includes(this)) {
+      throw new DOMException('Port at index ' + ports.indexOf(this) + ' is the source port.', 'DataCloneError');
+    }
+    if (state.remote) {
+      if (!state.closed) _postToRemotePort(state.remote, cloned, ports);
+      return;
+    }
     const target = state.entangled;
     const targetState = target && _messagePortState.get(target);
     if (state.closed || !targetState || targetState.closed) return;
     targetState.messageQueue.push({
       data: cloned,
+      ports,
       generation: _browserPostedTaskGeneration(),
     });
     _messagePortScheduleDelivery(target);
@@ -7992,12 +8025,15 @@ globalThis.self = globalThis;
 
 // Match Window's read-only document attribute. Script assignment is ignored in
 // sloppy mode and throws in strict mode, while navigation updates the backing
-// value through __obscura_init below.
+// value through __obscura_init below. Window's document and location are
+// [LegacyUnforgeable], so non-configurable; __obscura_init makes them so for
+// each window. The snapshot leaves them configurable because worker realms are
+// made from it too, and a worker has neither.
 let _document = null;
 Object.defineProperty(globalThis, "document", {
   get() { return _document; },
   enumerable: true,
-  configurable: false,
+  configurable: true,
 });
 function _resolveUrl(url) {
   url = String(url);
@@ -8079,7 +8115,7 @@ const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
   set(url) { __locationNavigate(String(url), false); },
-  configurable: false,
+  configurable: true, // made non-configurable per window by __obscura_init
   enumerable: true,
 });
 
@@ -13362,43 +13398,48 @@ function _structuredClone(value, seen) {
   }
   if (value === null || typeof value !== "object") return value;
   if (seen.has(value)) return seen.get(value);
+  // Types are told by their internal slots, not instanceof: a value from
+  // another realm (a worker's ArrayBuffer passing through a frame) is no
+  // instance of this realm's constructors and was copied as a plain {}.
+  // Clones are built from this realm's constructors.
+  const core = __obscuraCore;
   // Typed arrays: copy the underlying buffer slice. DataView has no .slice(),
   // so slice its buffer over the view's range and wrap a fresh view.
   if (ArrayBuffer.isView(value)) {
-    if (value instanceof DataView) {
-      const buf = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    if (core.isDataView(value)) {
+      const buf = ArrayBuffer.prototype.slice.call(value.buffer, value.byteOffset, value.byteOffset + value.byteLength);
       const copy = new DataView(buf);
       seen.set(value, copy);
       return copy;
     }
-    const Ctor = value.constructor;
-    const copy = new Ctor(value.slice());
+    const Ctor = globalThis[Object.prototype.toString.call(value).slice(8, -1)] || value.constructor;
+    const copy = new Ctor(value);
     seen.set(value, copy);
     return copy;
   }
-  if (value instanceof ArrayBuffer) {
-    const copy = value.slice(0);
+  if (core.isArrayBuffer(value)) {
+    const copy = ArrayBuffer.prototype.slice.call(value, 0);
     seen.set(value, copy);
     return copy;
   }
-  if (value instanceof SharedArrayBuffer) {
+  if (core.isSharedArrayBuffer(value)) {
     return value; // transferable, not copyable
   }
-  if (value instanceof Date) return new Date(value.getTime());
-  if (value instanceof RegExp) return new RegExp(value.source, value.flags);
-  if (value instanceof Map) {
+  if (core.isDate(value)) return new Date(Date.prototype.getTime.call(value));
+  if (core.isRegExp(value)) return new RegExp(value.source, value.flags);
+  if (core.isMap(value)) {
     const m = new Map();
     seen.set(value, m);
     for (const [k, v] of value) m.set(_structuredClone(k, seen), _structuredClone(v, seen));
     return m;
   }
-  if (value instanceof Set) {
+  if (core.isSet(value)) {
     const s = new Set();
     seen.set(value, s);
     for (const v of value) s.add(_structuredClone(v, seen));
     return s;
   }
-  if (value instanceof Error) {
+  if (core.isNativeError(value) || value instanceof Error) {
     const Ctor = value.constructor || Error;
     const e = new Ctor(value.message);
     // Record the clone before recursing into `cause`, otherwise a cycle
@@ -15996,17 +16037,118 @@ function _targetOriginAllows(targetOrigin, receiverOrigin, senderOrigin) {
   return receiverOrigin === expected;
 }
 
-function _sendRealmMessage(targetFrameId, data, targetOrigin) {
-  let json;
-  // Structured clone cannot cross realms here. JSON carries what postMessage is
-  // actually used for; anything else throws the same DataCloneError a browser
-  // throws for an unclonable value, rather than arriving silently as null.
+// Messages between realms travel through the host as text, so their data is
+// structured-serialized (V8's own format, as structuredClone) and carried as
+// base64. JSON lost ArrayBuffers, typed arrays, Maps and Dates on the way:
+// chatgpt.com's reply renderer sends its snapshot from a frame as buffers.
+const _realmBase64Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function _realmSerialize(value) {
+  let bytes;
   try {
-    json = JSON.stringify({ v: data === undefined ? null : data });
+    bytes = __obscuraCore.serialize(value === undefined ? null : value);
   } catch (_) {
     throw new DOMException('The object could not be cloned.', 'DataCloneError');
   }
-  if (json === undefined) json = '{"v":null}';
+  const a = _realmBase64Alphabet;
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+    out += a[(n >> 18) & 63] + a[(n >> 12) & 63]
+      + (i + 1 < bytes.length ? a[(n >> 6) & 63] : '=') + (i + 2 < bytes.length ? a[n & 63] : '=');
+  }
+  return out;
+}
+function _realmDeserialize(envelope) {
+  if (typeof envelope.s === 'string') {
+    try { return __obscuraCore.deserialize(_base64ToUint8Array(envelope.s)); } catch (_) { return null; }
+  }
+  return envelope.v === undefined ? null : envelope.v;
+}
+
+// MessagePorts transferred to or from another realm, by id. Both realms key
+// their end of a pair by the same id; port messages travel through the host
+// in a {port, v} envelope and are queued on the local end like any other.
+const _remotePorts = new Map();
+let _remotePortCounter = 0;
+
+function _transferList(transfer) {
+  const list = transfer && !Array.isArray(transfer) && typeof transfer === 'object'
+    ? transfer.transfer : transfer;
+  return list == null ? [] : Array.from(list);
+}
+
+function _queueRemotePortMessage(port, data, ports) {
+  const state = _messagePortState.get(port);
+  if (!state || state.closed) return;
+  state.messageQueue.push({ data, ports, generation: _browserPostedTaskGeneration() });
+  _messagePortScheduleDelivery(port);
+}
+
+function _postToRemotePort(remote, data, ports) {
+  let json = JSON.stringify({ port: remote.portId, s: _realmSerialize(data) });
+  if (ports && ports.length) {
+    const envelope = JSON.parse(json);
+    envelope.ports = _exportPorts(ports, remote.frameId >>> 0);
+    json = JSON.stringify(envelope);
+  }
+  __obscuraCore.ops.op_post_frame_message(remote.frameId >>> 0, '', json);
+}
+
+// Detach each transferred port from this realm: its entangled peer, which
+// stays here, now talks to the port's replacement in the target realm.
+function _exportPorts(ports, targetFrameId) {
+  const ids = [];
+  for (const port of ports) {
+    if (!(port instanceof MessagePort)) {
+      throw new DOMException('Value at index ' + ids.length + ' does not have a transferable type.', 'DataCloneError');
+    }
+    const state = _messagePortStateFor(port);
+    if (state.closed) throw new DOMException('A MessagePort could not be cloned because it was closed.', 'DataCloneError');
+    const id = (globalThis.__obscura_frameId >>> 0) + ':' + (++_remotePortCounter);
+    const peer = state.entangled;
+    const peerState = peer && _messagePortState.get(peer);
+    if (peerState && !peerState.closed) {
+      peerState.entangled = null;
+      peerState.remote = { frameId: targetFrameId, portId: id };
+      _remotePorts.set(id, peer);
+    } else if (state.remote) {
+      // Passing on a port that already talks to another realm.
+      _remotePorts.delete(state.remote.portId);
+      ids.push({ id: state.remote.portId, via: state.remote.frameId });
+      state.remote = null;
+      state.closed = true;
+      continue;
+    }
+    state.entangled = null;
+    state.closed = true;
+    state.messageQueue.length = 0;
+    ids.push({ id });
+  }
+  return ids;
+}
+
+function _importPorts(ids, sourceFrameId) {
+  return (Array.isArray(ids) ? ids : []).map(entry => {
+    const port = new MessagePort(_messagePortConstructionKey);
+    const state = _messagePortState.get(port);
+    state.remote = { frameId: entry.via != null ? entry.via : sourceFrameId, portId: String(entry.id) };
+    _remotePorts.set(String(entry.id), port);
+    return port;
+  });
+}
+
+function _sendRealmMessage(targetFrameId, data, targetOrigin, transfer) {
+  let json;
+  const ports = _transferList(transfer).filter(item => item instanceof MessagePort);
+  // An unclonable value throws the same DataCloneError a browser throws,
+  // rather than arriving silently as null.
+  json = JSON.stringify({ s: _realmSerialize(data) });
+  const sameRealm = (targetFrameId >>> 0) === (globalThis.__obscura_frameId >>> 0);
+  if (ports.length && !sameRealm) {
+    const envelope = JSON.parse(json);
+    envelope.ports = _exportPorts(ports, targetFrameId >>> 0);
+    json = JSON.stringify(envelope);
+  }
   // An unspecified targetOrigin stays permissive (empty string); the receiver
   // enforces a specified one against its own origin in __obscura_deliverMessage.
   const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
@@ -16015,11 +16157,11 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   // drain cross-realm messages. Serialize only once, before scheduling.
   const origin = _realmOrigin();
   if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
-  const clone = JSON.parse(json).v;
+  const clone = _realmDeserialize(JSON.parse(json));
   setTimeout(() => {
     try {
       globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+        new MessageEvent('message', { data: clone, origin, source: globalThis, ports })));
     } catch (error) {
       _internalConsole.error('message listener failed:', error && error.message || error);
     }
@@ -16131,8 +16273,8 @@ function _frameWindowFor(frameId) {
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
   const parentId = Reflect.get(real, '__obscura_parentFrameId') || 0;
-  const post = _markNative(function (data, targetOrigin, _transfer) {
-    _sendRealmMessage(frameId, data, targetOrigin);
+  const post = _markNative(function (data, targetOrigin, transfer) {
+    _sendRealmMessage(frameId, data, targetOrigin, transfer);
   });
   const win = new Proxy(real, {
     get(target, prop) {
@@ -16160,9 +16302,19 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
   // Enforce postMessage's targetOrigin against THIS (the receiving) realm's
   // origin, the same check a real browser does at delivery time. A mismatch
   // drops the message silently.
+  let envelope = null;
+  try { envelope = JSON.parse(dataJson); } catch (_) {}
+  if (envelope && typeof envelope.port === 'string') {
+    const port = _remotePorts.get(envelope.port);
+    if (port) {
+      _queueRemotePortMessage(port, _realmDeserialize(envelope),
+        envelope.ports ? _importPorts(envelope.ports, sourceFrameId) : []);
+    }
+    return;
+  }
   if (!_targetOriginAllows(targetOrigin, _realmOrigin(), origin)) return;
-  let data = null;
-  try { data = JSON.parse(dataJson).v; } catch (_) {}
+  const data = envelope ? _realmDeserialize(envelope) : null;
+  const ports = envelope && envelope.ports ? _importPorts(envelope.ports, sourceFrameId) : [];
   // Who to reply to: the frame above, or one of the frames below.
   const source = (globalThis.__obscura_frameId !== 0
                   && sourceFrameId === globalThis.__obscura_parentFrameId)
@@ -16174,7 +16326,7 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId, 
     // drop anything untrusted, so an untrusted event is not merely suspicious,
     // it is silently discarded and the widget waits forever.
     globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-      new MessageEvent('message', { data, origin, source })));
+      new MessageEvent('message', { data, origin, source, ports })));
   } catch (error) {
     _internalConsole.error('message listener failed:', error && error.message || error);
   }
@@ -16190,7 +16342,7 @@ class _RemoteWindow {
   constructor(frameId) {
     Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
   }
-  postMessage(data, targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data, targetOrigin); }
+  postMessage(data, targetOrigin, transfer) { _sendRealmMessage(this._frameId, data, targetOrigin, transfer); }
   get self() { return this; }
   get window() { return this; }
   get frames() { return this; }
@@ -16285,13 +16437,13 @@ class _IframeWindow {
     return proxy;
   }
 
-  postMessage(data, targetOrigin, _transfer) {
+  postMessage(data, targetOrigin, transfer) {
     // Into the frame's own realm, through the host. This used to dispatch the
     // event on the *parent's* window, so a page could never actually talk to
     // the document inside its iframe. A frame that has not loaded yet has no
     // browsing context to receive anything.
     if (!this._frameId) return;
-    _sendRealmMessage(this._frameId, data, targetOrigin);
+    _sendRealmMessage(this._frameId, data, targetOrigin, transfer);
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -17099,8 +17251,115 @@ const WORKER_GLOBALS = [
   'TransformStream', 'XMLHttpRequest', 'WebSocket', 'indexedDB', 'navigator', 'DOMException',
 ];
 
+// Runs inside a new worker realm (see op_create_worker_realm) to make its
+// global a DedicatedWorkerGlobalScope. Compiled by that realm's Function, so
+// everything here belongs to the worker. The creator's `bridge` is reachable
+// only through closures: a worker that deep-freezes its global must not reach
+// (and freeze) the creator's objects.
+const _WORKER_REALM_SETUP = `
+'use strict';
+const g = globalThis;
+
+const ET = EventTarget.prototype;
+// This realm's EventTarget methods keep listeners in this realm. Applied to
+// another realm's object, such as a transferred MessagePort, they defer to
+// that object's own methods so its events still reach the listener.
+for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+  const own = ET[name];
+  const wrapped = { [name](...args) {
+    const method = this === g || this == null ? undefined : this[name];
+    if (typeof method === 'function' && method !== wrapped && method !== own) {
+      return Reflect.apply(method, this, args);
+    }
+    return Reflect.apply(own, this, args);
+  } }[name];
+  Object.defineProperty(ET, name, { value: wrapped, writable: true, configurable: true, enumerable: true });
+}
+function WorkerGlobalScope() { throw new TypeError('Illegal constructor'); }
+function DedicatedWorkerGlobalScope() { throw new TypeError('Illegal constructor'); }
+WorkerGlobalScope.prototype = Object.create(ET, {
+  constructor: { value: WorkerGlobalScope, writable: true, configurable: true },
+});
+DedicatedWorkerGlobalScope.prototype = Object.create(WorkerGlobalScope.prototype, {
+  constructor: { value: DedicatedWorkerGlobalScope, writable: true, configurable: true },
+  [Symbol.toStringTag]: { value: 'DedicatedWorkerGlobalScope', configurable: true },
+});
+try { Object.setPrototypeOf(g, DedicatedWorkerGlobalScope.prototype); } catch (_) {}
+for (const key of ['document', 'window', 'parent', 'top', 'frames', 'opener', 'frameElement',
+    'alert', 'confirm', 'prompt', 'open', 'print', 'history', 'localStorage', 'sessionStorage',
+    'customElements', 'requestAnimationFrame', 'cancelAnimationFrame', 'getComputedStyle',
+    'matchMedia', 'visualViewport', 'screen']) {
+  try { if (!delete g[key]) Object.defineProperty(g, key, { value: undefined, configurable: true }); } catch (_) {}
+}
+const define = (key, value) => Object.defineProperty(g, key, { value, writable: true, configurable: true, enumerable: true });
+define('self', g);
+// A WorkerLocation, not the window's: the window's location setter navigates
+// the page, and a worker locking down its global assigns undefined to every
+// capability, location included (chatgpt.com's widget worker did, and sent
+// the page to /undefined).
+let workerUrl;
+try { workerUrl = new URL(url); } catch (_) { workerUrl = new URL('about:blank'); }
+const workerLocation = Object.create(null);
+for (const key of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) {
+  Object.defineProperty(workerLocation, key, { value: workerUrl[key], enumerable: true });
+}
+Object.defineProperty(workerLocation, 'toString', { value: function toString() { return workerUrl.href; } });
+define('location', workerLocation);
+define('WorkerGlobalScope', WorkerGlobalScope);
+define('DedicatedWorkerGlobalScope', DedicatedWorkerGlobalScope);
+define('name', name);
+define('onmessage', null);
+define('onmessageerror', null);
+define('postMessage', function postMessage(message, transfer) { bridge.post(message, transfer); });
+define('close', function close() { bridge.close(); });
+define('importScripts', function importScripts() {
+  throw new DOMException('importScripts() is not supported', 'NotSupportedError');
+});
+const dispatch = ET.dispatchEvent;
+const Message = MessageEvent;
+const evaluate = g.eval;
+return {
+  run(source) { evaluate(source); },
+  deliver(data, ports) {
+    // Dispatch also runs the onmessage handler attribute.
+    const event = new Message('message', { data, ports: ports || [] });
+    try { Reflect.apply(dispatch, g, [event]); } catch (error) { bridge.error(error); }
+  },
+};
+`;
+
+function _createWorkerRealm(bridge, name, url) {
+  if (typeof __obscuraCore.ops.op_create_worker_realm !== 'function') return null;
+  let child;
+  try { child = __obscuraCore.ops.op_create_worker_realm(); } catch (_) { return null; }
+  if (!child) return null;
+  try {
+    const core = child.__obscura_core_handoff;
+    for (const key of Object.keys(__obscuraCore.ops)) {
+      // A worker cannot navigate its creator's document.
+      if (key === 'op_navigate') continue;
+      core.ops[key] = __obscuraCore.ops[key];
+    }
+    delete child.__obscura_core_handoff;
+    delete child.Deno;
+    delete child.__bootstrap;
+    for (const key of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
+                       '__obscura_ua_platform_version', '__obscura_stealth',
+                       '__obscura_geo_lat', '__obscura_geo_lon']) {
+      if (globalThis[key] !== undefined) child[key] = globalThis[key];
+    }
+    _normalizeQueueMicrotask(child);
+    const setup = new child.Function('bridge', 'name', 'url', _WORKER_REALM_SETUP);
+    return setup(bridge, name, url);
+  } catch (error) {
+    _internalConsole.error('Worker realm setup failed:', error && error.message || error);
+    return null;
+  }
+}
+
 globalThis.Worker = class Worker {
-  constructor(url) {
+  constructor(url, options) {
+    this._name = options && options.name != null ? String(options.name) : '';
     this.onmessage = null;
     this.onerror = null;
     this._terminated = false;
@@ -17110,6 +17369,7 @@ globalThis.Worker = class Worker {
     const worker = this;
 
     let resolvedUrl = url;
+    this._url = String(url);
     if (typeof url === 'string') {
       const blob = globalThis.__blobStore?.[url];
       if (blob) {
@@ -17122,6 +17382,7 @@ globalThis.Worker = class Worker {
       if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
         try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
       }
+      this._url = resolvedUrl;
       (async () => {
         try {
           const resp = await fetch(resolvedUrl);
@@ -17137,9 +17398,10 @@ globalThis.Worker = class Worker {
       onmessage: null,
       WorkerGlobalScope: function WorkerGlobalScope() {},
       DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
-      postMessage: (msg) => {
+      postMessage: (msg, transfer) => {
         if (worker._terminated) return;
-        const evt = { data: msg };
+        // The worker shares this realm, so transferred ports pass as is.
+        const evt = { data: msg, ports: _transferList(transfer).filter(p => p instanceof MessagePort) };
         if (worker.onmessage) worker.onmessage(evt);
         const ls = worker._listeners['message'] || [];
         for (const h of ls) h(evt);
@@ -17183,8 +17445,37 @@ globalThis.Worker = class Worker {
     Object.defineProperty(scope, 'globalThis', { value: scope, writable: true, configurable: true });
     return scope;
   }
+  _dispatchToOwner(data, transfer) {
+    const worker = this;
+    const ports = _transferList(transfer).filter(p => p instanceof MessagePort);
+    setTimeout(() => {
+      if (worker._terminated) return;
+      const event = new MessageEvent('message', { data, ports });
+      if (typeof worker.onmessage === 'function') worker.onmessage(event);
+      for (const handler of (worker._listeners['message'] || []).slice()) handler.call(worker, event);
+    }, 0);
+  }
+  _reportError(error) {
+    _internalConsole.error('Worker error:', error);
+    if (typeof this.onerror === 'function') this.onerror(error);
+    for (const handler of (this._listeners['error'] || []).slice()) handler.call(this, error);
+  }
   _autoRun() {
-    if (this._terminated || this._scope || this._code === undefined) return;
+    if (this._terminated || this._scope || this._realm || this._code === undefined) return;
+    const worker = this;
+    const realm = _createWorkerRealm({
+      post: (data, transfer) => worker._dispatchToOwner(data, transfer),
+      close: () => worker.terminate(),
+      error: error => worker._reportError(error),
+    }, this._name, this._url);
+    if (realm) {
+      this._realm = realm;
+      try { realm.run(this._code); } catch (error) { this._reportError(error); }
+      if (!this._terminated) {
+        for (const [data, transfer] of this._pendingMessages.splice(0)) this.postMessage(data, transfer);
+      }
+      return;
+    }
     const scope = this._makeScope();
     try {
       // Direct eval preserves script directives and resolves bare handler names
@@ -17197,22 +17488,27 @@ globalThis.Worker = class Worker {
     } finally {
       if (!this._terminated) {
         this._scope = scope;
-        for (const data of this._pendingMessages.splice(0)) this.postMessage(data);
+        for (const [data, transfer] of this._pendingMessages.splice(0)) this.postMessage(data, transfer);
       }
     }
   }
-  postMessage(data) {
+  postMessage(data, transfer) {
     if (this._terminated) return;
-    if (!this._scope) {
-      this._pendingMessages.push(data);
+    if (!this._scope && !this._realm) {
+      this._pendingMessages.push([data, transfer]);
       return;
     }
     const worker = this;
+    const ports = _transferList(transfer).filter(p => p instanceof MessagePort);
+    if (this._realm) {
+      setTimeout(() => { if (!worker._terminated) worker._realm.deliver(data, ports); }, 0);
+      return;
+    }
     setTimeout(() => {
       if (worker._terminated || !worker._scope) return;
       const scope = worker._scope;
       try {
-        const event = { data };
+        const event = { data, ports };
         if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
         const evs = (scope._ev && scope._ev['message']) || [];
         for (const handler of evs.slice()) handler.call(scope, event);
@@ -17226,6 +17522,7 @@ globalThis.Worker = class Worker {
     this._terminated = true;
     this._pendingMessages.length = 0;
     this._scope = null;
+    this._realm = null;
   }
   addEventListener(type, fn) {
     if (!this._listeners[type]) this._listeners[type] = [];
@@ -17367,8 +17664,8 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // that posted to itself and waited for the `message` event waited forever.
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
-globalThis.postMessage = function(data, targetOrigin, _transfer) {
-  _sendRealmMessage(_realmFrameId, data, targetOrigin);
+globalThis.postMessage = function(data, targetOrigin, transfer) {
+  _sendRealmMessage(_realmFrameId, data, targetOrigin, transfer);
 };
 _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
@@ -19103,6 +19400,12 @@ globalThis.__obscura_init_frames = function() {
 globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  _normalizeQueueMicrotask();
+  for (const name of ['document', 'location']) {
+    if (Object.getOwnPropertyDescriptor(globalThis, name)?.configurable) {
+      Object.defineProperty(globalThis, name, { configurable: false });
+    }
+  }
   _scriptingEnabled = _domParse('scripting_enabled') !== false;
   _sandboxOpaqueOrigin = _domParse('sandbox_opaque_origin') === true;
   globalThis.__obscura_update_media_preferences();

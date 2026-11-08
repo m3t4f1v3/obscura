@@ -1961,6 +1961,30 @@ fn sync_resolved_percentage_padding(
     );
 }
 
+/// Whether a flex item is stretched to its single-line row container's
+/// height. With a definite container height, that stretched cross size is
+/// itself definite (CSS Flexbox 9.8), so the item's `height:100%` children
+/// resolve against it instead of computing to auto. App shells nest
+/// `display:flex` rows and `h-full` columns this way down to their scroll
+/// containers, which otherwise collapse to zero height.
+fn stretched_in_single_line_row(parent: &crate::LayoutStyle, item: &crate::LayoutStyle) -> bool {
+    use taffy::AlignItemsKeyword as K;
+    let row = matches!(
+        parent.flex_direction,
+        None | Some(taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse)
+    );
+    let single_line = matches!(parent.flex_wrap, None | Some(taffy::FlexWrap::NoWrap));
+    let stretch = |align: Option<taffy::AlignItems>| {
+        align.is_none_or(|align| matches!(align.keyword, K::Stretch | K::Normal))
+    };
+    let aligned = match item.align_self {
+        Some(align) if align.keyword != K::Normal => stretch(Some(align)),
+        _ => stretch(parent.align_items),
+    };
+    // Auto margins in the cross axis absorb the free space instead.
+    row && single_line && aligned && !item.margin_auto[0] && !item.margin_auto[2]
+}
+
 /// Taffy's flex stand-in for an inline formatting context can lose the
 /// block-axis percentage basis of its real containing block. Anonymous
 /// inline-run and float-placement wrappers have indefinite block sizes, so a
@@ -5537,15 +5561,17 @@ fn layout_dom_once(
                         style.height == crate::Dimension::Auto
                             && !style.display_contents
                             && !matches!(style.position, Some(taffy::Position::Absolute))
-                            && rendered_parent(tree, id)
+                            && box_parent(tree, id, |node| {
+                                styles.get(&node).is_some_and(|style| style.display_contents)
+                            })
                                 .and_then(|parent| styles.get(&parent))
                                 .is_some_and(|parent| {
                                     parent.display == crate::Display::Flex
                                         && !parent.internal_flex_container
-                                        && matches!(parent.flex_direction, Some(
+                                        && (matches!(parent.flex_direction, Some(
                                             taffy::FlexDirection::Column
                                                 | taffy::FlexDirection::ColumnReverse
-                                        ))
+                                        )) || stretched_in_single_line_row(parent, style))
                                 })
                     });
             let reused_computed_style = fresh_styles
@@ -5698,6 +5724,17 @@ fn layout_dom_once(
                             - style.border.right)
                             .max(0.0)
                     };
+                }
+                if styles.get(&id).is_some_and(|style| style.display_contents) {
+                    // A display:contents element generates no box, so its children's
+                    // containing block is its parent's: percentage sizes below it
+                    // resolve against the same width and definite or flex-deferred
+                    // height. Treating it as an auto-height box dropped that
+                    // definiteness under framework wrapper components.
+                    child_cb_width = inh.cb_width;
+                    child_cb_height = inh.cb_height;
+                    child_cb_height_definite = inh.cb_height_definite;
+                    child_cb_height_deferred = inh.cb_height_deferred;
                 }
                 inh.cb_width = child_cb_width;
                 inh.cb_height = child_cb_height;
@@ -6525,6 +6562,17 @@ fn layout_dom_once(
                             .max(0.0)
                     };
                 }
+            }
+            if id != root_id && styles.get(&id).is_some_and(|style| style.display_contents) {
+                // A display:contents element generates no box, so its children's
+                // containing block is its parent's: percentage sizes below it
+                // resolve against the same width and definite or flex-deferred
+                // height. Treating it as an auto-height box dropped that
+                // definiteness under framework wrapper components.
+                child_cb_width = inh.cb_width;
+                child_cb_height = inh.cb_height;
+                child_cb_height_definite = inh.cb_height_definite;
+                child_cb_height_deferred = inh.cb_height_deferred;
             }
             inh.cb_width = child_cb_width;
             inh.cb_height = child_cb_height;
@@ -10003,6 +10051,20 @@ pub(crate) fn rendered_children(tree: &DomTree, id: NodeId) -> Vec<NodeId> {
         })
         .into_iter()
         .collect()
+}
+
+/// The nearest flat-tree ancestor that generates a box: `display:contents`
+/// ancestors are skipped, so a flex item wrapped in them still finds its
+/// flex container.
+fn box_parent(tree: &DomTree, id: NodeId, is_contents: impl Fn(NodeId) -> bool) -> Option<NodeId> {
+    let mut parent = rendered_parent(tree, id);
+    for _ in 0..tree.len() {
+        match parent {
+            Some(node) if is_contents(node) => parent = rendered_parent(tree, node),
+            _ => break,
+        }
+    }
+    parent
 }
 
 /// The parent of `id` in the flattened rendering tree.

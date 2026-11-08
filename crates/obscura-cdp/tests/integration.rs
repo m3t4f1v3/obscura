@@ -58,6 +58,7 @@ integration_tests!(
     page_close_destroys_target,
     page_frame_contract,
     parser_preload_link_switches_to_stylesheet,
+    percentage_height_through_stretch_and_contents,
     runtime_by_value_undefined,
     runtime_console_events,
     runtime_get_properties_objectid_escaping,

@@ -19197,7 +19197,8 @@ if (typeof WebSocket === 'undefined') {
       }
       let parsed;
       try {
-        parsed = new URL(String(url), document.baseURI);
+        // Workers have no document; their base is their own location.
+        parsed = new URL(String(url), globalThis.document ? document.baseURI : globalThis.location?.href);
       } catch (e) {
         throw syntaxError("The URL '" + url + "' is invalid.");
       }

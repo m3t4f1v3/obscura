@@ -61,6 +61,7 @@ integration_tests!(
     nodefilter_constants,
     page_close_destroys_target,
     page_frame_contract,
+    page_websocket,
     parser_preload_link_switches_to_stylesheet,
     percentage_height_through_stretch_and_contents,
     runtime_by_value_undefined,

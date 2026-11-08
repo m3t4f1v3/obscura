@@ -301,8 +301,10 @@ impl FrameRealm {
     /// the page. One script throwing does not stop the ones after it, matching
     /// how a browser treats separate classic scripts.
     ///
-    /// Module scripts are skipped and reported: they need the frame's own module
-    /// loader, which is not wired up yet.
+    /// Module scripts run after the classic ones, in document order, as
+    /// deferred module scripts do. They are evaluated without a module loader:
+    /// one that imports another module fails and is reported (see
+    /// `ObscuraJsRuntime::eval_module_in_realm`).
     ///
     /// Returns one message per script that failed or was skipped.
     pub fn run_document_scripts(
@@ -316,10 +318,11 @@ impl FrameRealm {
         };
 
         let mut problems = Vec::new();
+        let mut modules = Vec::new();
         for (index, script) in scripts.iter().enumerate() {
             if !script.is_classic() {
                 if script.type_attribute == "module" {
-                    problems.push(format!("frame module script {index} skipped: not supported"));
+                    modules.push((index, script));
                 }
                 continue;
             }
@@ -343,10 +346,28 @@ impl FrameRealm {
                 problems.push(format!("frame script {name} failed: {error}"));
             }
         }
+        for (index, script) in modules {
+            let (url, source) = if script.src.is_empty() {
+                (self.url.clone(), script.text.clone())
+            } else {
+                let resolved = self.resolve(&script.src);
+                match load_external(&resolved) {
+                    Some(source) => (resolved, source),
+                    None => {
+                        problems.push(format!("frame module script {resolved} could not be loaded"));
+                        continue;
+                    }
+                }
+            };
+            if let Err(error) = parent.eval_module_in_realm(&self.context, &source, &url) {
+                problems.push(format!("frame module script {index} ({url}) failed: {error}"));
+            }
+        }
         problems
     }
 
-    /// Absolute URLs of the frame's `src=` classic scripts, in document order.
+    /// Absolute URLs of the frame's `src=` classic and module scripts, in
+    /// document order.
     ///
     /// A caller that fetches over the network needs the list before running
     /// anything, because `run_document_scripts` resolves sources synchronously.
@@ -354,7 +375,9 @@ impl FrameRealm {
         self.list_scripts()
             .unwrap_or_default()
             .iter()
-            .filter(|script| script.is_classic() && !script.src.is_empty())
+            .filter(|script| {
+                (script.is_classic() || script.type_attribute == "module") && !script.src.is_empty()
+            })
             .map(|script| self.resolve(&script.src))
             .collect()
     }
@@ -1209,17 +1232,51 @@ mod tests {
 
         let problems = frame.run_document_scripts(&mut parent, |_| None);
 
+        // The module script runs after the classic ones, as deferred.
         assert_eq!(
             frame.evaluate(&mut parent, "window.log.join(',')").unwrap(),
-            serde_json::json!("a,b")
+            serde_json::json!("a,b,module")
         );
-        assert_eq!(problems.len(), 3, "problems: {problems:?}");
+        assert_eq!(problems.len(), 2, "problems: {problems:?}");
         assert!(problems.iter().any(|p| p.contains("boom")), "{problems:?}");
         assert!(
             problems.iter().any(|p| p.contains("missing.js")),
             "{problems:?}"
         );
-        assert!(problems.iter().any(|p| p.contains("module")), "{problems:?}");
+    }
+
+    #[test]
+    fn frame_module_scripts_run_with_module_semantics() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/runner.html",
+            r#"<html><head>
+               <script type="module" src="runner.js"></script>
+               <script type="module">import "./other.js"; window.imported = true;</script>
+               <script>window.log = ['classic'];</script>
+               </head><body></body></html>"#,
+        )
+        .expect("frame realm");
+
+        let problems = frame.run_document_scripts(&mut parent, |url| {
+            (url == "https://child.example/runner.js").then(|| {
+                "const local = 1; window.log.push(typeof this, import.meta.url, typeof local);".to_string()
+            })
+        });
+
+        assert_eq!(
+            frame.evaluate(&mut parent, "window.log").unwrap(),
+            serde_json::json!(["classic", "undefined", "https://child.example/runner.js", "number"]),
+            "module scope, undefined this and import.meta.url",
+        );
+        // Module-scoped bindings stay out of the global object.
+        assert_eq!(frame.evaluate(&mut parent, "typeof local").unwrap(), serde_json::json!("undefined"));
+        assert_eq!(frame.evaluate(&mut parent, "window.imported === undefined").unwrap(), serde_json::json!(true));
+        assert_eq!(problems.len(), 1, "problems: {problems:?}");
+        assert!(problems[0].contains("other.js"), "an import is reported: {problems:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

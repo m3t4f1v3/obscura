@@ -298,6 +298,53 @@ pub struct ObscuraJsRuntime {
     js_runtime: JsRuntime,
 }
 
+// URLs of frame module scripts by module identity hash, for import.meta.
+// The table is bounded; clearing it only empties import.meta.url of modules
+// that have not read it yet.
+const MAX_FRAME_MODULE_URLS: usize = 4096;
+thread_local! {
+    static FRAME_MODULE_URLS: std::cell::RefCell<std::collections::HashMap<i32, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// deno_core's import.meta hook for modules its module map does not track:
+/// frame module scripts get `import.meta.url`.
+fn frame_module_import_meta<'s, 'i, 'm, 'o>(
+    scope: &mut deno_core::v8::PinScope<'s, 'i>,
+    module: deno_core::v8::Local<'m, deno_core::v8::Module>,
+    meta: deno_core::v8::Local<'o, deno_core::v8::Object>,
+) {
+    use deno_core::v8;
+    let hash = module.get_identity_hash().get();
+    let Some(url) = FRAME_MODULE_URLS.with(|urls| urls.borrow().get(&hash).cloned()) else {
+        return;
+    };
+    if let (Some(key), Some(value)) = (v8::String::new(scope, "url"), v8::String::new(scope, &url)) {
+        meta.create_data_property(scope, key.into(), value.into());
+    }
+}
+
+/// Module linking for frame module scripts: they have no loader, so any
+/// static import fails with a TypeError naming the specifier.
+fn reject_frame_module_import<'s>(
+    context: deno_core::v8::Local<'s, deno_core::v8::Context>,
+    specifier: deno_core::v8::Local<'s, deno_core::v8::String>,
+    _import_attributes: deno_core::v8::Local<'s, deno_core::v8::FixedArray>,
+    _referrer: deno_core::v8::Local<'s, deno_core::v8::Module>,
+) -> Option<deno_core::v8::Local<'s, deno_core::v8::Module>> {
+    use deno_core::v8;
+    v8::callback_scope!(unsafe scope, context);
+    let message = format!(
+        "Cannot import {:?}: module scripts in frames cannot import other modules",
+        specifier.to_rust_string_lossy(scope)
+    );
+    if let Some(message) = v8::String::new(scope, &message) {
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+    }
+    None
+}
+
 /// Renders a caught V8 exception as a message for realm evaluation errors.
 fn exception_text(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
@@ -996,6 +1043,63 @@ impl ObscuraJsRuntime {
             Some(value) => Ok(value.to_rust_string_lossy(tc_scope)),
             None => Err(exception_text(tc_scope)),
         }
+    }
+
+    /// Evaluates `source` as a module script inside a frame realm.
+    ///
+    /// Frame realms have no module loader of their own, so this supports a
+    /// module without static imports: bundled module scripts such as
+    /// sandboxed widget runners. A static import fails module linking with a
+    /// TypeError naming the specifier. `import.meta.url` is the module's URL.
+    pub(crate) fn eval_module_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &str,
+        url: &str,
+    ) -> Result<(), String> {
+        use deno_core::v8;
+
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        deno_core::register_external_module_import_meta_cb(scope, frame_module_import_meta);
+        v8::tc_scope!(let tc_scope, scope);
+
+        let code = v8::String::new(tc_scope, source).ok_or("source too large")?;
+        let name = v8::String::new(tc_scope, url).ok_or("module URL too large")?;
+        let origin = v8::ScriptOrigin::new(
+            tc_scope, name.into(), 0, 0, false, 0, None, false, false, true, None,
+        );
+        let mut compilation = v8::script_compiler::Source::new(code, Some(&origin));
+        let Some(module) = v8::script_compiler::compile_module(tc_scope, &mut compilation) else {
+            return Err(exception_text(tc_scope));
+        };
+        FRAME_MODULE_URLS.with(|urls| {
+            let mut urls = urls.borrow_mut();
+            if urls.len() >= MAX_FRAME_MODULE_URLS {
+                urls.clear();
+            }
+            urls.insert(module.get_identity_hash().get(), url.to_string());
+        });
+        if module.instantiate_module(tc_scope, reject_frame_module_import) != Some(true) {
+            return Err(exception_text(tc_scope));
+        }
+        let Some(completion) = module.evaluate(tc_scope) else {
+            return Err(exception_text(tc_scope));
+        };
+        if module.get_status() == v8::ModuleStatus::Errored {
+            let exception = module.get_exception();
+            return Err(exception.to_rust_string_lossy(tc_scope));
+        }
+        // Evaluation returns a promise; a synchronous throw rejects it.
+        if let Ok(promise) = v8::Local::<v8::Promise>::try_from(completion) {
+            if promise.state() == v8::PromiseState::Rejected {
+                return Err(promise.result(tc_scope).to_rust_string_lossy(tc_scope));
+            }
+        }
+        Ok(())
     }
 
     /// Copies the browser-identity globals from the main realm into `realm`.

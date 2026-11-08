@@ -28,6 +28,7 @@ integration_tests!(
     call_function_on_object_id_arg,
     cdp_click_submit_parity,
     child_frame_tree,
+    click_focuses_contenteditable,
     concurrent_connections_heavy_page,
     concurrent_navigations,
     concurrent_navigations_with_fetch,

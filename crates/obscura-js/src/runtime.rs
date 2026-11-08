@@ -9751,6 +9751,33 @@ mod tests {
     }
 
     #[test]
+    fn insert_text_command_edits_the_focused_editor_at_its_caret() {
+        let mut rt = setup_runtime(r#"<body><div id="e" contenteditable="true">ab</div>
+            <textarea id="t">xy</textarea><p id="p">plain</p></body>"#);
+        assert_eq!(rt.evaluate(r#"(() => {
+            const events = [];
+            const editor = document.getElementById('e');
+            editor.addEventListener('input', e => events.push(e.inputType + ':' + e.data));
+            editor.focus();
+            const range = document.createRange();
+            range.setStart(editor.firstChild, 1);
+            range.collapse(true);
+            getSelection().removeAllRanges();
+            getSelection().addRange(range);
+            const editorResult = document.execCommand('insertText', false, 'Z');
+            const area = document.getElementById('t');
+            area.focus();
+            area.setSelectionRange(1, 1);
+            const areaResult = document.execCommand('insertText', false, '-');
+            document.getElementById('p').focus();
+            return [editorResult, editor.textContent, events, areaResult, area.value,
+                document.execCommand('bold'), document.queryCommandSupported('insertText')];
+        })()"#).unwrap(), serde_json::json!([
+            true, "aZb", ["insertText:Z"], true, "x-y", false, true
+        ]));
+    }
+
+    #[test]
     fn editing_command_detection_checks_receiver_and_converts_domstring() {
         let mut rt = setup_runtime("<body></body>");
         assert_eq!(rt.evaluate(r#"(() => {

@@ -5017,6 +5017,32 @@ class Element extends Node {
     }
     return this.getAttribute("value") || "";
   }
+  // HTML contentEditable / isContentEditable. Editors (Lexical, ProseMirror,
+  // Slate) and Playwright's fill() decide whether an element is editable from
+  // these: "true"/""/"plaintext-only" make an editing host, "false" stops
+  // editability, anything else inherits from the parent.
+  get contentEditable() {
+    const value = this.getAttribute('contenteditable');
+    if (value === null) return 'inherit';
+    const lower = value.toLowerCase();
+    if (lower === '' || lower === 'true') return 'true';
+    if (lower === 'false' || lower === 'plaintext-only') return lower;
+    return 'inherit';
+  }
+  set contentEditable(v) {
+    const value = String(v).toLowerCase();
+    if (value === 'inherit') this.removeAttribute('contenteditable');
+    else if (value === 'true' || value === 'false' || value === 'plaintext-only') this.setAttribute('contenteditable', value);
+    else throw new DOMException("Failed to set the 'contentEditable' property: The value provided ('" + v + "') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.", 'SyntaxError');
+  }
+  get isContentEditable() {
+    for (let node = this; node && node.nodeType === 1; node = node.parentNode) {
+      const state = node.contentEditable;
+      if (state === 'true' || state === 'plaintext-only') return this.isConnected;
+      if (state === 'false') return false;
+    }
+    return false;
+  }
   // FileList for <input type=file>, populated by DOM.setFileInputFiles (Puppeteer
   // uploadFile / Playwright setInputFiles). null for non-file inputs, matching
   // the DOM. See __obscura_setInputFiles (issue #359).
@@ -7205,11 +7231,60 @@ class Document extends Node {
     if (!_documentInstances.has(this)) throw new TypeError('Illegal invocation');
     if (arguments.length < 1) throw new TypeError('queryCommandSupported requires 1 argument');
     commandId = `${commandId}`;
-    // execCommand currently implements no editing commands. Feature detection
+    // insertText is the only editing command implemented. Feature detection
     // must not advertise clipboard or formatting actions that do nothing.
-    return false;
+    return commandId.toLowerCase() === 'inserttext';
   }
-  execCommand() { return false; }
+  // execCommand('insertText'): editors handling paste themselves insert the
+  // pasted text at the caret this way. Other commands do nothing.
+  execCommand(commandId, _showUI, value) {
+    if (`${commandId}`.toLowerCase() !== 'inserttext') return false;
+    return _execInsertText(this, value === undefined ? '' : `${value}`);
+  }
+}
+
+function _execInsertText(doc, text) {
+  const target = doc.activeElement;
+  if (!target || target === doc.body) return false;
+  const fire = (type, cancelable) => target.dispatchEvent(globalThis.__obscura_markTrusted(
+    new InputEvent(type, { bubbles: true, composed: true, cancelable, data: text, inputType: 'insertText' })));
+  if (target.localName === 'input' || target.localName === 'textarea') {
+    if (target.hasAttribute('readonly') || globalThis.__obscura_isDisabled(target)) return false;
+    if (!fire('beforeinput', true)) return true;
+    const current = target.value || '';
+    let start = target.selectionStart, end = target.selectionEnd;
+    if (start == null) start = end = current.length;
+    const lo = Math.max(0, Math.min(start, end, current.length));
+    const hi = Math.min(current.length, Math.max(start, end));
+    globalThis.__obscura_setFieldValue(target, 'value', current.slice(0, lo) + text + current.slice(hi));
+    try { target.setSelectionRange(lo + text.length, lo + text.length); } catch (_) {}
+    fire('input', false);
+    return true;
+  }
+  const host = target.closest &&
+    target.closest('[contenteditable=""], [contenteditable="true" i], [contenteditable="plaintext-only" i]');
+  if (!host) return false;
+  if (!fire('beforeinput', true)) return true;
+  const node = doc.createTextNode(text);
+  let inserted = false;
+  try {
+    const selection = doc.getSelection && doc.getSelection();
+    if (selection && selection.rangeCount) {
+      const range = selection.getRangeAt(0);
+      if (host.contains(range.commonAncestorContainer)) {
+        range.deleteContents();
+        range.insertNode(node);
+        range.setStartAfter(node);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        inserted = true;
+      }
+    }
+  } catch (_) {}
+  if (!inserted) host.appendChild(node);
+  fire('input', false);
+  return true;
 }
 
 // Shared by write and the final EOF flush. A nonnegative parent is a real node,
@@ -12191,7 +12266,17 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
     this.total = i.total != null ? Number(i.total) : 0;
   }
 };
-globalThis.ClipboardEvent = class extends Event {};
+// clipboardData carries a paste's payload: editors (ProseMirror, Lexical,
+// Slate) read it in their paste handler and insert the text themselves, so a
+// synthetic paste is how automation enters text into a contenteditable.
+globalThis.ClipboardEvent = class ClipboardEvent extends Event {
+  constructor(type, init) {
+    super(type, init || {});
+    const data = init && init.clipboardData;
+    this._clipboardData = typeof DataTransfer === 'function' && data instanceof DataTransfer ? data : null;
+  }
+  get clipboardData() { return this._clipboardData; }
+};
 globalThis.SubmitEvent = class extends Event {};
 
 // ToggleEvent backs the popover beforetoggle/toggle events. oldState and
